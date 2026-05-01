@@ -10,7 +10,7 @@ This is an open-source browser tool for inspecting Spine 3.7 assets. Drop or bro
 ## Build From Source
 
 ```powershell
-git clone [<repo-url>](https://github.com/MadlyMoe/SpineViewer)
+git clone https://github.com/MadlyMoe/SpineViewer
 cd SpineViewer
 npm install
 npm run build
