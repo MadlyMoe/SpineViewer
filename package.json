@@ -13,6 +13,7 @@
   "dependencies": {
     "@pixi-spine/base": "^4.0.6",
     "@pixi-spine/runtime-3.7": "^4.0.6",
+    "gifenc": "^1.0.3",
     "pixi.js": "^7.4.3"
   },
   "devDependencies": {

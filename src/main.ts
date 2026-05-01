@@ -3,6 +3,7 @@ import * as PIXI from "pixi.js";
 import { BaseTexture, MIPMAP_MODES, SCALE_MODES, Texture } from "pixi.js";
 import { TextureAtlas } from "@pixi-spine/base";
 import { AtlasAttachmentLoader, SkeletonData, SkeletonJson, Spine } from "@pixi-spine/runtime-3.7";
+import { GIFEncoder, applyPalette, quantize, type GifPalette } from "gifenc";
 import { SkeletonBinary37 } from "./skeletonBinary37";
 
 type SpineData = SkeletonData & {
@@ -84,6 +85,24 @@ root.innerHTML = `
       </section>
 
       <section class="panelBlock">
+        <label>GIF Export</label>
+        <div class="controlGrid">
+          <label for="gifFpsInput">FPS</label>
+          <input id="gifFpsInput" type="number" min="1" max="60" step="1" value="24" />
+          <label for="gifSecondsInput">Seconds</label>
+          <input id="gifSecondsInput" type="number" min="0.5" max="20" step="0.1" value="3.3" />
+          <label for="gifWidthInput">Width</label>
+          <input id="gifWidthInput" type="number" min="128" max="1920" step="64" value="640" />
+          <label for="gifBackgroundSelect">Background</label>
+          <select id="gifBackgroundSelect">
+            <option value="transparent">Transparent</option>
+            <option value="discord">Discord matte</option>
+          </select>
+        </div>
+        <button id="exportGifButton" type="button" disabled>Export GIF</button>
+      </section>
+
+      <section class="panelBlock">
         <label for="zoomRange">Zoom</label>
         <input id="zoomRange" type="range" min="0.25" max="2" step="0.05" value="1" disabled />
         <button id="fitButton" type="button" disabled>Fit</button>
@@ -110,6 +129,11 @@ const animationSelect = document.getElementById("animationSelect") as HTMLSelect
 const playButton = document.getElementById("playButton") as HTMLButtonElement;
 const stopButton = document.getElementById("stopButton") as HTMLButtonElement;
 const speedRange = document.getElementById("speedRange") as HTMLInputElement;
+const gifFpsInput = document.getElementById("gifFpsInput") as HTMLInputElement;
+const gifSecondsInput = document.getElementById("gifSecondsInput") as HTMLInputElement;
+const gifWidthInput = document.getElementById("gifWidthInput") as HTMLInputElement;
+const gifBackgroundSelect = document.getElementById("gifBackgroundSelect") as HTMLSelectElement;
+const exportGifButton = document.getElementById("exportGifButton") as HTMLButtonElement;
 const zoomRange = document.getElementById("zoomRange") as HTMLInputElement;
 const fitButton = document.getElementById("fitButton") as HTMLButtonElement;
 
@@ -119,6 +143,7 @@ PIXI.settings.MIPMAP_TEXTURES = MIPMAP_MODES.ON;
 const app = new PIXI.Application({
   resizeTo: viewerFrame,
   backgroundColor: 0x111111,
+  backgroundAlpha: 0,
   antialias: true,
   autoDensity: true,
   resolution: Math.min(window.devicePixelRatio || 1, 3),
@@ -128,6 +153,7 @@ viewerFrame.appendChild(app.view as HTMLCanvasElement);
 let active: LoadedSpine | null = null;
 let playing = false;
 let trackLoaded = false;
+let exportingGif = false;
 setStatus("Drop .skel/.json + .atlas + .png, or browse files.");
 
 function setStatus(message = "") {
@@ -309,12 +335,18 @@ function centerInStage(spine: SpineDisplay, zoom = active?.zoom ?? 1) {
 function updateControlState() {
   const pose = selectedPose();
   const hasPose = Boolean(pose && active?.spine);
+  const hasAnimation = hasPose && (pose?.data.animations.length ?? 0) > 0;
   poseSelect.disabled = !hasPose || (active?.poses.length ?? 0) < 2;
   skinSelect.disabled = !hasPose || (pose?.data.skins.length ?? 0) < 2;
-  animationSelect.disabled = !hasPose || (pose?.data.animations.length ?? 0) === 0;
+  animationSelect.disabled = !hasAnimation || exportingGif;
   playButton.disabled = animationSelect.disabled;
   stopButton.disabled = animationSelect.disabled;
   speedRange.disabled = animationSelect.disabled;
+  exportGifButton.disabled = !hasAnimation || exportingGif;
+  gifFpsInput.disabled = exportingGif;
+  gifSecondsInput.disabled = exportingGif;
+  gifWidthInput.disabled = exportingGif;
+  gifBackgroundSelect.disabled = exportingGif;
   zoomRange.disabled = !hasPose;
   fitButton.disabled = !hasPose;
 }
@@ -484,6 +516,391 @@ fitButton.addEventListener("click", () => {
   zoomRange.value = "1";
   centerInStage(active.spine, active.zoom);
 });
+exportGifButton.addEventListener("click", () => {
+  exportCurrentGif().catch((error) => {
+    exportingGif = false;
+    updateControlState();
+    setStatus(`GIF export failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+});
+
+async function exportCurrentGif() {
+  if (!active?.spine) return;
+  const pose = selectedPose();
+  const animationName = animationSelect.value;
+  if (!pose || !animationName) return;
+
+  exportingGif = true;
+  updateControlState();
+
+  const spine = active.spine;
+  const previousPlaying = playing;
+  const previousAutoUpdate = spine.autoUpdate;
+  const previousTimeScale = spine.state.timeScale;
+  const fps = clamp(Math.round(Number(gifFpsInput.value) || 24), 1, 60);
+  const seconds = clamp(Number(gifSecondsInput.value) || getAnimationDurationSeconds(pose, animationName), 0.5, 20);
+  const frameCount = Math.max(1, Math.round(fps * seconds));
+  const delay = 1000 / fps;
+  const exportWidth = clamp(Math.round(Number(gifWidthInput.value) || 640), 128, 1920);
+  const playbackSpeed = Number(speedRange.value) || 1;
+  const transparentExport = gifBackgroundSelect.value !== "discord";
+
+  try {
+    setStatus(`Rendering GIF frames: 0/${frameCount}`);
+    playing = false;
+    spine.autoUpdate = false;
+    resetSkeletonPose(spine);
+    spine.state.setAnimation(0, animationName, true);
+    spine.state.timeScale = 1;
+    trackLoaded = true;
+
+    const exportBounds = measureAnimationBounds(spine, animationName, frameCount, fps, playbackSpeed);
+    resetSkeletonPose(spine);
+    spine.state.setAnimation(0, animationName, true);
+    spine.state.timeScale = 1;
+
+    let frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }> = [];
+    let width = 0;
+    let height = 0;
+
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      if (frame > 0) spine.update((1 / fps) * playbackSpeed);
+      else spine.update(0);
+
+      const captured = renderTransparentSpineFrame(spine, exportBounds, exportWidth);
+      frames.push(captured);
+      width = captured.width;
+      height = captured.height;
+
+      if (frame % 5 === 0 || frame === frameCount - 1) {
+        setStatus(`Rendering GIF frames: ${frame + 1}/${frameCount}`);
+        await nextAnimationFrame();
+      }
+    }
+
+    frames = cropFramesToVisibleAlpha(frames);
+    width = frames[0]?.width ?? width;
+    height = frames[0]?.height ?? height;
+    if (!transparentExport) {
+      frames = applyMatteToFrames(frames, [49, 51, 56]);
+    }
+
+    setStatus("Building shared GIF palette...");
+    await nextAnimationFrame();
+    const palette = buildSharedGifPalette(frames, transparentExport);
+    const gif = GIFEncoder();
+    const transparentIndex = 0;
+
+    for (let frame = 0; frame < frames.length; frame += 1) {
+      const index = applyPalette(frames[frame].rgba, palette, transparentExport ? "rgba4444" : "rgb565");
+      if (transparentExport) {
+        forceTransparentGifIndex(index, frames[frame].rgba, transparentIndex);
+        gif.writeFrame(
+          index,
+          width,
+          height,
+          frame === 0
+            ? { palette, delay, repeat: 0, transparent: true, transparentIndex, dispose: 2 }
+            : { delay, transparent: true, transparentIndex, dispose: 2 }
+        );
+      } else {
+        gif.writeFrame(index, width, height, frame === 0 ? { palette, delay, repeat: 0 } : { delay });
+      }
+
+      if (frame % 5 === 0 || frame === frameCount - 1) {
+        setStatus(`Encoding GIF: ${frame + 1}/${frameCount} frames`);
+        await nextAnimationFrame();
+      }
+    }
+
+    gif.finish();
+    const bytes = gif.bytesView();
+    const gifBytes = new Uint8Array(bytes.length);
+    gifBytes.set(bytes);
+    const blob = new Blob([gifBytes.buffer as ArrayBuffer], { type: "image/gif" });
+    const suffix = transparentExport ? "" : "-discord";
+    downloadBlob(blob, `${fileBaseName(pose.file.name)}-${animationName}${suffix}.gif`);
+    setStatus(`Exported GIF: ${frameCount} frames, ${fps} FPS, ${Math.round(blob.size / 1024)} KB`);
+  } finally {
+    spine.autoUpdate = previousAutoUpdate;
+    spine.state.timeScale = previousTimeScale;
+    playing = previousPlaying;
+    applyCurrentAnimation(true);
+    playButton.textContent = playing ? "Pause" : "Play";
+    if (active?.spine) active.spine.state.timeScale = playing ? Number(speedRange.value) : 0;
+    exportingGif = false;
+    updateControlState();
+  }
+}
+
+function measureAnimationBounds(
+  spine: SpineDisplay,
+  animationName: string,
+  frameCount: number,
+  fps: number,
+  playbackSpeed: number
+) {
+  let union: PIXI.Rectangle | null = null;
+
+  resetSkeletonPose(spine);
+  spine.state.setAnimation(0, animationName, true);
+  spine.state.timeScale = 1;
+
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    if (frame > 0) spine.update((1 / fps) * playbackSpeed);
+    else spine.update(0);
+
+    const bounds = spine.getLocalBounds();
+    if (bounds.width <= 0 || bounds.height <= 0) continue;
+    if (!union) {
+      union = new PIXI.Rectangle(bounds.x, bounds.y, bounds.width, bounds.height);
+    } else {
+      const minX = Math.min(union.x, bounds.x);
+      const minY = Math.min(union.y, bounds.y);
+      const maxX = Math.max(union.x + union.width, bounds.x + bounds.width);
+      const maxY = Math.max(union.y + union.height, bounds.y + bounds.height);
+      union.x = minX;
+      union.y = minY;
+      union.width = maxX - minX;
+      union.height = maxY - minY;
+    }
+  }
+
+  return union ?? spine.getLocalBounds();
+}
+
+function renderTransparentSpineFrame(spine: SpineDisplay, bounds: PIXI.Rectangle, maxWidth: number) {
+  const padding = 12;
+  const scale = maxWidth / Math.max(1, bounds.width);
+  const width = Math.max(1, Math.ceil(bounds.width * scale + padding * 2));
+  const height = Math.max(1, Math.ceil(bounds.height * scale + padding * 2));
+  const previous = captureSpineTransform(spine);
+  const renderTexture = PIXI.RenderTexture.create({
+    width,
+    height,
+    resolution: 1,
+    scaleMode: SCALE_MODES.LINEAR,
+  });
+  renderTexture.baseTexture.clearColor = [0, 0, 0, 0];
+
+  try {
+    spine.position.set(padding - bounds.x * scale, padding - bounds.y * scale);
+    spine.scale.set(scale);
+    spine.pivot.set(0, 0);
+    spine.skew.set(0, 0);
+    spine.rotation = 0;
+    const black = renderSpineFrameWithClear(spine, renderTexture, width, height, [0, 0, 0, 1]);
+    const white = renderSpineFrameWithClear(spine, renderTexture, width, height, [1, 1, 1, 1]);
+    const rgba = recoverAlphaFromMattePair(black, white);
+    return { rgba, width, height };
+  } finally {
+    restoreSpineTransform(spine, previous);
+    renderTexture.destroy(true);
+  }
+}
+
+function renderSpineFrameWithClear(
+  spine: SpineDisplay,
+  renderTexture: PIXI.RenderTexture,
+  width: number,
+  height: number,
+  clearColor: [number, number, number, number]
+) {
+  const renderer = app.renderer as PIXI.Renderer;
+  renderer.renderTexture.bind(renderTexture);
+  renderer.renderTexture.clear(clearColor);
+  renderer.render(spine, { renderTexture, clear: false });
+  const canvas = renderer.extract.canvas(renderTexture) as HTMLCanvasElement;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) throw new Error("Could not read GIF export frame.");
+  return context.getImageData(0, 0, width, height).data;
+}
+
+function recoverAlphaFromMattePair(black: Uint8ClampedArray, white: Uint8ClampedArray) {
+  const rgba = new Uint8ClampedArray(black.length);
+
+  for (let offset = 0; offset < black.length; offset += 4) {
+    const diffR = white[offset] - black[offset];
+    const diffG = white[offset + 1] - black[offset + 1];
+    const diffB = white[offset + 2] - black[offset + 2];
+    const matteDiff = clamp(Math.max(diffR, diffG, diffB), 0, 255);
+    const alpha = clamp(255 - matteDiff, 0, 255);
+
+    if (alpha <= 4) {
+      rgba[offset] = 0;
+      rgba[offset + 1] = 0;
+      rgba[offset + 2] = 0;
+      rgba[offset + 3] = 0;
+      continue;
+    }
+
+    const alphaScale = 255 / alpha;
+    rgba[offset] = clamp(Math.round(black[offset] * alphaScale), 0, 255);
+    rgba[offset + 1] = clamp(Math.round(black[offset + 1] * alphaScale), 0, 255);
+    rgba[offset + 2] = clamp(Math.round(black[offset + 2] * alphaScale), 0, 255);
+    rgba[offset + 3] = alpha;
+  }
+
+  return rgba;
+}
+
+function cropFramesToVisibleAlpha(frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>) {
+  if (!frames.length) return frames;
+
+  const alphaThreshold = 16;
+  const padding = 4;
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const frame of frames) {
+    for (let y = 0; y < frame.height; y += 1) {
+      for (let x = 0; x < frame.width; x += 1) {
+        const alpha = frame.rgba[(y * frame.width + x) * 4 + 3];
+        if (alpha <= alphaThreshold) continue;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+    return frames;
+  }
+
+  minX = Math.max(0, minX - padding);
+  minY = Math.max(0, minY - padding);
+  maxX = Math.min(frames[0].width - 1, maxX + padding);
+  maxY = Math.min(frames[0].height - 1, maxY + padding);
+
+  const width = maxX - minX + 1;
+  const height = maxY - minY + 1;
+
+  return frames.map((frame) => {
+    const rgba = new Uint8ClampedArray(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      const sourceStart = ((minY + y) * frame.width + minX) * 4;
+      const sourceEnd = sourceStart + width * 4;
+      rgba.set(frame.rgba.subarray(sourceStart, sourceEnd), y * width * 4);
+    }
+    return { rgba, width, height };
+  });
+}
+
+function applyMatteToFrames(
+  frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>,
+  matteRgb: [number, number, number]
+) {
+  return frames.map((frame) => {
+    const rgba = new Uint8ClampedArray(frame.rgba.length);
+
+    for (let offset = 0; offset < frame.rgba.length; offset += 4) {
+      const alpha = frame.rgba[offset + 3] / 255;
+      const inverseAlpha = 1 - alpha;
+      rgba[offset] = Math.round(frame.rgba[offset] * alpha + matteRgb[0] * inverseAlpha);
+      rgba[offset + 1] = Math.round(frame.rgba[offset + 1] * alpha + matteRgb[1] * inverseAlpha);
+      rgba[offset + 2] = Math.round(frame.rgba[offset + 2] * alpha + matteRgb[2] * inverseAlpha);
+      rgba[offset + 3] = 255;
+    }
+
+    return {
+      rgba,
+      width: frame.width,
+      height: frame.height,
+    };
+  });
+}
+
+function captureSpineTransform(spine: SpineDisplay) {
+  return {
+    scaleX: spine.scale.x,
+    scaleY: spine.scale.y,
+    x: spine.position.x,
+    y: spine.position.y,
+    pivotX: spine.pivot.x,
+    pivotY: spine.pivot.y,
+    skewX: spine.skew.x,
+    skewY: spine.skew.y,
+    rotation: spine.rotation,
+  };
+}
+
+function restoreSpineTransform(spine: SpineDisplay, transform: ReturnType<typeof captureSpineTransform>) {
+  spine.scale.set(transform.scaleX, transform.scaleY);
+  spine.position.set(transform.x, transform.y);
+  spine.pivot.set(transform.pivotX, transform.pivotY);
+  spine.skew.set(transform.skewX, transform.skewY);
+  spine.rotation = transform.rotation;
+}
+
+function buildSharedGifPalette(frames: Array<{ rgba: Uint8ClampedArray }>, transparent: boolean): GifPalette {
+  const totalPixels = frames.reduce((sum, frame) => sum + frame.rgba.length / 4, 0);
+  const maxSamplePixels = 250000;
+  const stride = Math.max(1, Math.ceil(totalPixels / maxSamplePixels));
+  const sample = new Uint8Array(Math.ceil(totalPixels / stride) * 4);
+  let writeOffset = 0;
+  let pixelIndex = 0;
+
+  for (const frame of frames) {
+    const rgba = frame.rgba;
+    for (let offset = 0; offset < rgba.length; offset += 4) {
+      if (pixelIndex % stride === 0) {
+        sample[writeOffset] = rgba[offset];
+        sample[writeOffset + 1] = rgba[offset + 1];
+        sample[writeOffset + 2] = rgba[offset + 2];
+        sample[writeOffset + 3] = rgba[offset + 3];
+        writeOffset += 4;
+      }
+      pixelIndex += 1;
+    }
+  }
+
+  if (transparent) {
+    const palette = quantize(sample.subarray(0, writeOffset), 255, { format: "rgba4444" });
+    return [[0, 0, 0, 0], ...palette];
+  }
+
+  return quantize(sample.subarray(0, writeOffset), 256);
+}
+
+function forceTransparentGifIndex(index: Uint8Array, rgba: Uint8ClampedArray, transparentIndex: number) {
+  for (let pixel = 0, offset = 0; offset < rgba.length; pixel += 1, offset += 4) {
+    if (rgba[offset + 3] < 96) {
+      index[pixel] = transparentIndex;
+    }
+  }
+}
+
+function getAnimationDurationSeconds(pose: LoadedPose, animationName: string) {
+  const animation = pose.data.animations.find((item) => item.name === animationName) as { duration?: number } | undefined;
+  return animation?.duration && Number.isFinite(animation.duration) ? animation.duration : 3.3;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function fileBaseName(name: string) {
+  return normalizeName(name).replace(/\.(skel|json)$/i, "") || "spine";
+}
+
+function downloadBlob(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName.replace(/[<>:"/\\|?*]+/g, "_");
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function nextAnimationFrame() {
+  return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
 
 function hasFiles(event: DragEvent) {
   return Array.from(event.dataTransfer?.types ?? []).includes("Files");

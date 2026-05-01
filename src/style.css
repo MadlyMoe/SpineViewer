@@ -69,7 +69,8 @@ label {
 }
 
 button,
-select {
+select,
+input[type="number"] {
   min-height: 34px;
   border: 1px solid #666;
   border-radius: 4px;
@@ -83,7 +84,8 @@ button {
 }
 
 button:hover:not(:disabled),
-select:hover:not(:disabled) {
+select:hover:not(:disabled),
+input[type="number"]:hover:not(:disabled) {
   background: #29292c;
 }
 
@@ -97,6 +99,12 @@ input:disabled {
 
 select {
   width: 100%;
+  padding: 6px 8px;
+}
+
+input[type="number"] {
+  width: 100%;
+  box-sizing: border-box;
   padding: 6px 8px;
 }
 
@@ -130,6 +138,13 @@ input[type="range"] {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.controlGrid {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px;
+  align-items: center;
 }
 
 #viewerPanel {
