@@ -1,6 +1,6 @@
-# Revival:Side Spine Viewer
+# Counter:Side Spine Viewer
 
-Revival:Side Spine Viewer is an open-source browser tool for inspecting Spine 3.7 assets. Drop or browse for matching `.skel` or `.json`, `.atlas`, and `.png` files to view setup poses, skins, and embedded animations.
+This is an open-source browser tool for inspecting Spine 3.7 assets. Drop or browse for matching `.skel` or `.json`, `.atlas`, and `.png` files to view setup poses, skins, and embedded animations.
 
 ## Requirements
 
