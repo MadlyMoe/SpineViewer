@@ -581,9 +581,15 @@ async function exportCurrentGif() {
     frames = cropFramesToVisibleAlpha(frames);
     width = frames[0]?.width ?? width;
     height = frames[0]?.height ?? height;
-    if (!transparentExport) {
+    if (transparentExport) {
+      frames = prepareTransparentGifFrames(frames);
+    } else {
       frames = applyMatteToFrames(frames, [49, 51, 56]);
     }
+    frames = stabilizeDarkGifColors(frames);
+    frames = stabilizeTemporalDarkPixels(frames);
+    frames = stabilizeLightGifColors(frames);
+    frames = stabilizeTemporalLightPixels(frames);
 
     setStatus("Building shared GIF palette...");
     await nextAnimationFrame();
@@ -592,9 +598,9 @@ async function exportCurrentGif() {
     const transparentIndex = 0;
 
     for (let frame = 0; frame < frames.length; frame += 1) {
-      const index = applyPalette(frames[frame].rgba, palette, transparentExport ? "rgba4444" : "rgb565");
+      const index = applyPalette(frames[frame].rgba, palette, "rgb565");
       if (transparentExport) {
-        forceTransparentGifIndex(index, frames[frame].rgba, transparentIndex);
+        applyTransparentGifIndex(index, frames[frame].rgba, palette, transparentIndex);
         gif.writeFrame(
           index,
           width,
@@ -814,6 +820,181 @@ function applyMatteToFrames(
   });
 }
 
+function prepareTransparentGifFrames(frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>) {
+  const alphaThreshold = 96;
+
+  return frames.map((frame) => {
+    const rgba = new Uint8ClampedArray(frame.rgba.length);
+
+    for (let offset = 0; offset < frame.rgba.length; offset += 4) {
+      const alpha = frame.rgba[offset + 3];
+      if (alpha < alphaThreshold) {
+        rgba[offset] = 0;
+        rgba[offset + 1] = 0;
+        rgba[offset + 2] = 0;
+        rgba[offset + 3] = 0;
+      } else {
+        rgba[offset] = frame.rgba[offset];
+        rgba[offset + 1] = frame.rgba[offset + 1];
+        rgba[offset + 2] = frame.rgba[offset + 2];
+        rgba[offset + 3] = 255;
+      }
+    }
+
+    return {
+      rgba,
+      width: frame.width,
+      height: frame.height,
+    };
+  });
+}
+
+function stabilizeDarkGifColors(frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>) {
+  return frames.map((frame) => {
+    const rgba = new Uint8ClampedArray(frame.rgba);
+
+    for (let offset = 0; offset < rgba.length; offset += 4) {
+      if (rgba[offset + 3] === 0) continue;
+
+      const r = rgba[offset];
+      const g = rgba[offset + 1];
+      const b = rgba[offset + 2];
+      const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const chroma = max - min;
+
+      if (luma < 92 || (max < 130 && chroma < 48)) {
+        const step = luma < 36 ? 12 : 18;
+        rgba[offset] = snapChannel(r, step);
+        rgba[offset + 1] = snapChannel(g, step);
+        rgba[offset + 2] = snapChannel(b, step);
+      }
+    }
+
+    return {
+      rgba,
+      width: frame.width,
+      height: frame.height,
+    };
+  });
+}
+
+function stabilizeTemporalDarkPixels(frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>) {
+  if (frames.length < 2) return frames;
+
+  const stabilized = [frames[0]];
+  for (let frameIndex = 1; frameIndex < frames.length; frameIndex += 1) {
+    const previous = stabilized[frameIndex - 1];
+    const current = frames[frameIndex];
+    const rgba = new Uint8ClampedArray(current.rgba);
+
+    for (let offset = 0; offset < rgba.length; offset += 4) {
+      if (rgba[offset + 3] < 240 || previous.rgba[offset + 3] < 240) continue;
+
+      const r = rgba[offset];
+      const g = rgba[offset + 1];
+      const b = rgba[offset + 2];
+      const pr = previous.rgba[offset];
+      const pg = previous.rgba[offset + 1];
+      const pb = previous.rgba[offset + 2];
+      const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const prevLuma = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
+      if (luma >= 120 && prevLuma >= 120) continue;
+
+      const distance = Math.abs(r - pr) + Math.abs(g - pg) + Math.abs(b - pb);
+      if (distance > 0 && distance <= 54) {
+        rgba[offset] = pr;
+        rgba[offset + 1] = pg;
+        rgba[offset + 2] = pb;
+      }
+    }
+
+    stabilized.push({
+      rgba,
+      width: current.width,
+      height: current.height,
+    });
+  }
+
+  return stabilized;
+}
+
+function stabilizeLightGifColors(frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>) {
+  return frames.map((frame) => {
+    const rgba = new Uint8ClampedArray(frame.rgba);
+
+    for (let offset = 0; offset < rgba.length; offset += 4) {
+      if (rgba[offset + 3] === 0) continue;
+
+      const r = rgba[offset];
+      const g = rgba[offset + 1];
+      const b = rgba[offset + 2];
+      const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+
+      if (luma > 172 && chroma < 76) {
+        const step = luma > 226 ? 10 : 14;
+        rgba[offset] = snapChannel(r, step);
+        rgba[offset + 1] = snapChannel(g, step);
+        rgba[offset + 2] = snapChannel(b, step);
+      }
+    }
+
+    return {
+      rgba,
+      width: frame.width,
+      height: frame.height,
+    };
+  });
+}
+
+function stabilizeTemporalLightPixels(frames: Array<{ rgba: Uint8ClampedArray; width: number; height: number }>) {
+  if (frames.length < 2) return frames;
+
+  const stabilized = [frames[0]];
+  for (let frameIndex = 1; frameIndex < frames.length; frameIndex += 1) {
+    const previous = stabilized[frameIndex - 1];
+    const current = frames[frameIndex];
+    const rgba = new Uint8ClampedArray(current.rgba);
+
+    for (let offset = 0; offset < rgba.length; offset += 4) {
+      if (rgba[offset + 3] < 240 || previous.rgba[offset + 3] < 240) continue;
+
+      const r = rgba[offset];
+      const g = rgba[offset + 1];
+      const b = rgba[offset + 2];
+      const pr = previous.rgba[offset];
+      const pg = previous.rgba[offset + 1];
+      const pb = previous.rgba[offset + 2];
+      const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const prevLuma = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
+      const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+      const prevChroma = Math.max(pr, pg, pb) - Math.min(pr, pg, pb);
+      if (luma <= 172 || prevLuma <= 172 || chroma >= 86 || prevChroma >= 86) continue;
+
+      const distance = Math.abs(r - pr) + Math.abs(g - pg) + Math.abs(b - pb);
+      if (distance > 0 && distance <= 60) {
+        rgba[offset] = pr;
+        rgba[offset + 1] = pg;
+        rgba[offset + 2] = pb;
+      }
+    }
+
+    stabilized.push({
+      rgba,
+      width: current.width,
+      height: current.height,
+    });
+  }
+
+  return stabilized;
+}
+
+function snapChannel(value: number, step: number) {
+  return clamp(Math.round(value / step) * step, 0, 255);
+}
+
 function captureSpineTransform(spine: SpineDisplay) {
   return {
     scaleX: spine.scale.x,
@@ -838,7 +1019,7 @@ function restoreSpineTransform(spine: SpineDisplay, transform: ReturnType<typeof
 
 function buildSharedGifPalette(frames: Array<{ rgba: Uint8ClampedArray }>, transparent: boolean): GifPalette {
   const totalPixels = frames.reduce((sum, frame) => sum + frame.rgba.length / 4, 0);
-  const maxSamplePixels = 250000;
+  const maxSamplePixels = 1000000;
   const stride = Math.max(1, Math.ceil(totalPixels / maxSamplePixels));
   const sample = new Uint8Array(Math.ceil(totalPixels / stride) * 4);
   let writeOffset = 0;
@@ -847,7 +1028,7 @@ function buildSharedGifPalette(frames: Array<{ rgba: Uint8ClampedArray }>, trans
   for (const frame of frames) {
     const rgba = frame.rgba;
     for (let offset = 0; offset < rgba.length; offset += 4) {
-      if (pixelIndex % stride === 0) {
+      if (rgba[offset + 3] > 0 && pixelIndex % stride === 0) {
         sample[writeOffset] = rgba[offset];
         sample[writeOffset + 1] = rgba[offset + 1];
         sample[writeOffset + 2] = rgba[offset + 2];
@@ -859,19 +1040,46 @@ function buildSharedGifPalette(frames: Array<{ rgba: Uint8ClampedArray }>, trans
   }
 
   if (transparent) {
-    const palette = quantize(sample.subarray(0, writeOffset), 255, { format: "rgba4444" });
-    return [[0, 0, 0, 0], ...palette];
+    const palette = writeOffset > 0 ? quantize(sample.subarray(0, writeOffset), 255) : [];
+    return [[255, 0, 255], ...palette];
   }
 
   return quantize(sample.subarray(0, writeOffset), 256);
 }
 
-function forceTransparentGifIndex(index: Uint8Array, rgba: Uint8ClampedArray, transparentIndex: number) {
+function applyTransparentGifIndex(
+  index: Uint8Array,
+  rgba: Uint8ClampedArray,
+  palette: GifPalette,
+  transparentIndex: number
+) {
   for (let pixel = 0, offset = 0; offset < rgba.length; pixel += 1, offset += 4) {
     if (rgba[offset + 3] < 96) {
       index[pixel] = transparentIndex;
+    } else if (index[pixel] === transparentIndex) {
+      index[pixel] = nearestOpaquePaletteIndex(rgba[offset], rgba[offset + 1], rgba[offset + 2], palette, transparentIndex);
     }
   }
+}
+
+function nearestOpaquePaletteIndex(r: number, g: number, b: number, palette: GifPalette, transparentIndex: number) {
+  let bestIndex = transparentIndex === 0 ? 1 : 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (let index = 0; index < palette.length; index += 1) {
+    if (index === transparentIndex) continue;
+    const color = palette[index];
+    const dr = r - color[0];
+    const dg = g - color[1];
+    const db = b - color[2];
+    const distance = dr * dr + dg * dg + db * db;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+
+  return bestIndex;
 }
 
 function getAnimationDurationSeconds(pose: LoadedPose, animationName: string) {
