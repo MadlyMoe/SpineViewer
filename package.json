@@ -1,0 +1,23 @@
+{
+  "name": "revival-side-spine-viewer",
+  "version": "1.0.0",
+  "description": "A browser-based Spine 3.7 drag-and-drop viewer for Revival:Side assets.",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@pixi-spine/base": "^4.0.6",
+    "@pixi-spine/runtime-3.7": "^4.0.6",
+    "pixi.js": "^7.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}
